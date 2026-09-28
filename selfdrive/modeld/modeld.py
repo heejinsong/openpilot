@@ -34,6 +34,12 @@ LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
 
+# Temporary override for testing custom control setpoints (bypass model action/plan).
+# Start with small curvature; longitudinal still goes through plannerd unless experimentalMode.
+OVERRIDE_MODEL_ACTION = True
+OVERRIDE_DESIRED_CURVATURE = 0.001   # 1/m  (~0.1 m/s^2 lat accel at 10 m/s)
+OVERRIDE_DESIRED_ACCELERATION = 0.0  # m/s^2
+OVERRIDE_SHOULD_STOP = False
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
@@ -301,7 +307,14 @@ def main(demo=False):
 
       frame_delay = DT_MDL # compensate for time passed since the frame was captured: current_time - timestamp_eof is 50ms on average
       action_delay = DT_MDL / 2 # middle of the interval between model output (current state) and next frame (expected state)
-      action = get_action_from_model(model_output, prev_action, lat_delay + frame_delay + action_delay, long_delay + frame_delay + action_delay, v_ego)
+      if OVERRIDE_MODEL_ACTION:
+        action = log.ModelDataV2.Action(
+            desiredCurvature=float(OVERRIDE_DESIRED_CURVATURE),
+            desiredAcceleration=float(OVERRIDE_DESIRED_ACCELERATION),
+            shouldStop=bool(OVERRIDE_SHOULD_STOP),
+        )
+      else:
+        action = get_action_from_model(model_output, prev_action, lat_delay + frame_delay + action_delay, long_delay + frame_delay + action_delay, v_ego)
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
