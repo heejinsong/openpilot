@@ -38,13 +38,18 @@ def not_joystick(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not params.get_bool("JoystickDebugMode")
 
 def long_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started and params.get_bool("LongitudinalManeuverMode")
+  return started and params.get_bool("LongitudinalManeuverMode") and not params.get_bool("WaypointMode")
 
 def lat_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started and params.get_bool("LateralManeuverMode")
+  # Exclusive with WaypointMode — both publish lateralManeuverPlan
+  return started and params.get_bool("LateralManeuverMode") and not params.get_bool("WaypointMode")
+
+def waypoint(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and params.get_bool("WaypointMode")
 
 def not_long_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started and not params.get_bool("LongitudinalManeuverMode")
+  # plannerd off for long maneuver OR waypoint mode (waypointsd owns longitudinalPlan)
+  return started and not params.get_bool("LongitudinalManeuverMode") and not params.get_bool("WaypointMode")
 
 def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not ublox_available()
@@ -107,6 +112,7 @@ procs = [
   PythonProcess("plannerd", "openpilot.selfdrive.controls.plannerd", not_long_maneuver),
   PythonProcess("maneuversd", "openpilot.tools.longitudinal_maneuvers.maneuversd", long_maneuver),
   PythonProcess("lateral_maneuversd", "openpilot.tools.lateral_maneuvers.lateral_maneuversd", lat_maneuver),
+  PythonProcess("waypointsd", "openpilot.tools.waypoints.waypointsd", waypoint),
   PythonProcess("radard", "openpilot.selfdrive.controls.radard", only_onroad),
   PythonProcess("hardwared", "openpilot.system.hardware.hardwared", always_run),
   PythonProcess("modem", "openpilot.common.hardware.comma.modem", always_run, enabled=COMMA_HARDWARE),
