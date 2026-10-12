@@ -2,14 +2,16 @@
 """
 waypointsd: external timed waypoints (imu_link) -> lat + long setpoints for controlsd.
 
-Input (preferred): UDP packets from the AV laptop ROS2 bridge
-  tools/waypoints/ros2_to_comma_waypoints.py
-  payload = Float64MultiArray.data as little-endian float64[]
+Input: UDP Float64MultiArray layout (x,y only) from the laptop ROS2 bridge.
   [version, t_sec, t_nsec, plan_sec, plan_nsec, n, x0,y0, ..., x7,y7]
   frame = imu_link (x forward, y left), ~20 Hz
 
-Fallback: WAYPOINTS_MOCK=1 -> straight-line mock (debug only).
+Smoothing (same (x,y) plan, nicer κ/a):
+  - speed-proportional lookahead time
+  - path-speed estimate + light moving average + curvature speed cap
+  - EMA + rate limits (jerk) on κ and a
 
+Fallback: WAYPOINTS_MOCK=1 -> straight-line mock.
 When WaypointMode is on, plannerd is stopped; this process owns longitudinalPlan.
 """
 from __future__ import annotations
@@ -25,6 +27,7 @@ from openpilot.cereal import messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from opendbc.car.structs import car
 from openpilot.common.params import Params
+from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, should_stop, smooth_value
 from openpilot.tools.waypoints.plan_msg import (
@@ -36,20 +39,45 @@ from openpilot.tools.waypoints.plan_msg import (
 N_WAYPOINTS = 8
 T_WAYPOINTS = (np.arange(N_WAYPOINTS, dtype=float) + 1.0) * DT_WAYPOINT  # 0.5 .. 4.0
 
-ACTION_T = 0.5
-LAT_SMOOTH_SECONDS = 0.1
-LONG_SMOOTH_SECONDS = 0.3
-MIN_LOOKAHEAD = 1.0
+# Lookahead time scales with speed: t = clip(L/v), L = clip(gain*v, Lmin, Lmax)
+LOOKAHEAD_GAIN = 1.0          # seconds of "distance gain" ~ L ≈ v * gain at mid speeds
+LOOKAHEAD_MIN_M = 3.0
+LOOKAHEAD_MAX_M = 12.0
+ACTION_T_MIN = 0.35
+ACTION_T_MAX = 1.2
 
-# No new plan within this window -> stop using waypoints (lat falls back to model)
-WAYPOINT_TIMEOUT_S = 0.35
+LAT_SMOOTH_SECONDS = 0.2
+LONG_SMOOTH_SECONDS = 0.4
+
+# Rate limits after EMA (comfort)
+MAX_KAPPA_RATE = 0.12          # 1/m per second
+MAX_ACCEL_JERK = 1.2           # m/s^3
+
+# Soft lateral accel cap used only to trim path-derived speeds in bends
+A_LAT_MAX = 1.8               # m/s^2
+
+MIN_LOOKAHEAD = 1.0
+WAYPOINT_TIMEOUT_S = 0.5
 
 UDP_PORT = int(os.environ.get("WAYPOINTS_UDP_PORT", "9845"))
 USE_MOCK = os.environ.get("WAYPOINTS_MOCK", "0") == "1"
 
 
+def lookahead_time(v_ego: float) -> float:
+  """Speed-proportional lookahead horizon along the timed plan."""
+  v = max(v_ego, MIN_SPEED)
+  L = float(np.clip(LOOKAHEAD_GAIN * v, LOOKAHEAD_MIN_M, LOOKAHEAD_MAX_M))
+  return float(np.clip(L / v, ACTION_T_MIN, ACTION_T_MAX))
+
+
+def rate_limit(new: float, prev: float, max_rate: float, dt: float) -> float:
+  if dt <= 0 or max_rate <= 0:
+    return new
+  return float(prev + np.clip(new - prev, -max_rate * dt, max_rate * dt))
+
+
 def curvature_from_local_waypoints(t: np.ndarray, x: np.ndarray, y: np.ndarray,
-                                  action_t: float = ACTION_T) -> tuple[float, float, float]:
+                                  action_t: float) -> tuple[float, float, float]:
   x_t = float(np.interp(action_t, t, x))
   y_t = float(np.interp(action_t, t, y))
   L = max(math.hypot(x_t, y_t), MIN_LOOKAHEAD)
@@ -58,18 +86,54 @@ def curvature_from_local_waypoints(t: np.ndarray, x: np.ndarray, y: np.ndarray,
   return float(kappa), x_t, y_t
 
 
+def _segment_curvatures(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+  """Rough |κ| at each waypoint from consecutive triples (endpoints copy neighbor)."""
+  n = len(x)
+  kappa = np.zeros(n, dtype=float)
+  if n < 3:
+    return kappa
+  for i in range(1, n - 1):
+    x0, y0 = float(x[i - 1]), float(y[i - 1])
+    x1, y1 = float(x[i]), float(y[i])
+    x2, y2 = float(x[i + 1]), float(y[i + 1])
+    a = math.hypot(x1 - x0, y1 - y0)
+    b = math.hypot(x2 - x1, y2 - y1)
+    c = math.hypot(x2 - x0, y2 - y0)
+    area2 = abs((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0))
+    denom = a * b * c
+    kappa[i] = (2.0 * area2 / denom) if denom > 1e-3 else 0.0
+  kappa[0] = kappa[1]
+  kappa[-1] = kappa[-2]
+  return kappa
+
+
 def speeds_from_path(t: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+  """Path speeds from (x,y,t), then MA + curvature-based speed cap for comfort."""
   v = np.zeros(len(t), dtype=float)
   px, py, pt = 0.0, 0.0, 0.0
   for i in range(len(t)):
     dt = max(float(t[i] - pt), 1e-3)
     v[i] = math.hypot(float(x[i]) - px, float(y[i]) - py) / dt
     px, py, pt = float(x[i]), float(y[i]), float(t[i])
-  return v
+
+  # 3-point moving average to kill segment noise
+  v_s = v.copy()
+  for i in range(len(v)):
+    i0, i1 = max(0, i - 1), min(len(v) - 1, i + 1)
+    v_s[i] = float(np.mean(v[i0:i1 + 1]))
+
+  # Limit speed in bends: v <= sqrt(a_lat_max / |κ|)
+  kappa = _segment_curvatures(x, y)
+  for i in range(len(v_s)):
+    k = abs(float(kappa[i]))
+    if k > 1e-4:
+      v_s[i] = min(v_s[i], math.sqrt(A_LAT_MAX / k))
+
+  return v_s
 
 
 def accel_from_local_speeds(t: np.ndarray, v: np.ndarray, v_ego: float, a_ego: float,
-                           action_t: float = ACTION_T) -> float:
+                           action_t: float) -> float:
   v_t = float(np.interp(action_t, t, v))
   return float(2.0 * (v_t - v_ego) / action_t - a_ego)
 
@@ -84,18 +148,14 @@ class WaypointTracker:
     self.last_recv_mono = 0.0
     self.prev_kappa = 0.0
     self.prev_a = 0.0
+    self.prev_action_mono: float | None = None
 
   def update_from_plan(self, plan: UnpackedPlan, recv_mono: float | None = None) -> None:
-    """Apply irisav plan; times are relative to plan stamp, shifted by packet age."""
     if plan.n != N_WAYPOINTS:
-      # Allow n!=8 by resampling onto default horizon if needed later; for now require 8.
       raise ValueError(f"expected n={N_WAYPOINTS}, got {plan.n}")
 
     now = time.monotonic() if recv_mono is None else recv_mono
-    # Clocks on laptop vs comma are not assumed synced; only use local receive age.
-    # Treat plan as generated ~now when packet arrives; age grows until next packet.
-    t_rel = plan.waypoint_times_from_plan()  # 0.5 .. 4.0 at receive instant
-    self.t = t_rel
+    self.t = plan.waypoint_times_from_plan()
     self.x = plan.x.astype(float)
     self.y = plan.y.astype(float)
     self.v = speeds_from_path(self.t, self.x, self.y)
@@ -123,22 +183,33 @@ class WaypointTracker:
   def get_actions(self, v_ego: float, a_ego: float) -> tuple[float, float] | None:
     now = time.monotonic()
     if not self.fresh(now):
+      self.prev_action_mono = None
       return None
 
-    # Advance time base by packet age so ACTION_T is "from now"
+    dt = DT_MDL if self.prev_action_mono is None else max(now - self.prev_action_mono, 1e-3)
+    self.prev_action_mono = now
+
     age = now - self.last_recv_mono
     t_now = self.t - age
     if t_now[-1] <= 0.05:
       return None
-    # Keep interp domain valid: clamp negative times to small epsilon for speed/path at "now"
     t_use = np.maximum(t_now, 1e-3)
 
-    kappa, _, _ = curvature_from_local_waypoints(t_use, self.x, self.y, ACTION_T)
-    a = accel_from_local_speeds(t_use, self.v, v_ego, a_ego, ACTION_T)
+    action_t = lookahead_time(v_ego)
+    # Stay inside remaining horizon
+    action_t = float(min(action_t, float(t_use[-1]) * 0.95))
+
+    kappa_raw, _, _ = curvature_from_local_waypoints(t_use, self.x, self.y, action_t)
+    a_raw = accel_from_local_speeds(t_use, self.v, v_ego, a_ego, action_t)
+    a_raw = float(np.clip(a_raw, ACCEL_MIN, ACCEL_MAX))
+
+    # EMA then rate-limit (jerk) for comfort
+    kappa = float(smooth_value(kappa_raw, self.prev_kappa, LAT_SMOOTH_SECONDS, dt=dt))
+    a = float(smooth_value(a_raw, self.prev_a, LONG_SMOOTH_SECONDS, dt=dt))
+    kappa = rate_limit(kappa, self.prev_kappa, MAX_KAPPA_RATE, dt)
+    a = rate_limit(a, self.prev_a, MAX_ACCEL_JERK, dt)
     a = float(np.clip(a, ACCEL_MIN, ACCEL_MAX))
 
-    kappa = float(smooth_value(kappa, self.prev_kappa, LAT_SMOOTH_SECONDS))
-    a = float(smooth_value(a, self.prev_a, LONG_SMOOTH_SECONDS))
     self.prev_kappa, self.prev_a = kappa, a
     return kappa, a
 
@@ -160,7 +231,6 @@ def _open_udp(port: int) -> socket.socket:
 
 
 def _drain_udp(sock: socket.socket, tracker: WaypointTracker) -> bool:
-  """Read latest UDP plan; return True if at least one valid plan applied."""
   got = False
   while True:
     try:
@@ -184,8 +254,8 @@ def main():
   sm = messaging.SubMaster(['carState', 'carControl', 'selfdriveState', 'modelV2'], poll='modelV2')
   pm = messaging.PubMaster(['lateralManeuverPlan', 'longitudinalPlan', 'alertDebug'])
 
-  tracker = WaypointTracker()
-  udp_sock = None if USE_MOCK else _open_udp(UDP_PORT)
+  tracker = WaypointTracker() # plan 저장
+  udp_sock = None if USE_MOCK else _open_udp(UDP_PORT) # mock이 아닐때만 9845 listen
   if USE_MOCK:
     cloudlog.warning("waypointsd WAYPOINTS_MOCK=1 — using straight mock, not ROS2")
 
@@ -193,8 +263,8 @@ def main():
     sm.update()
 
     CS = sm['carState']
-    v_ego = max(CS.vEgo, 0.0)
-    a_ego = float(CS.aEgo)
+    v_ego = max(CS.vEgo, 0.0) # 현재 속도
+    a_ego = float(CS.aEgo) # 현재 가속도
 
     if USE_MOCK:
       x, y, v = _mock_straight_waypoints(v_ego)
@@ -202,10 +272,13 @@ def main():
     elif udp_sock is not None:
       _drain_udp(udp_sock, tracker)
 
-    actions = tracker.get_actions(v_ego, a_ego)
+    # k, a 계산
+    actions = tracker.get_actions(v_ego, a_ego) # fresh면 k, a 계산
     lat_active = bool(sm['carControl'].latActive)
     age = (time.monotonic() - tracker.last_recv_mono) if tracker.has_waypoints else float("inf")
+    action_t = lookahead_time(v_ego)
 
+    # 화면 debug
     alert_msg = messaging.new_message('alertDebug')
     alert_msg.valid = True
     if actions is None:
@@ -215,16 +288,17 @@ def main():
     else:
       kappa, a_target = actions
       alert_msg.alertDebug.alertText1 = f'wp κ={kappa:+.4f} a={a_target:+.2f}'
-      alert_msg.alertDebug.alertText2 = f'v={v_ego * 3.6:.1f}km/h age={age*1000:.0f}ms'
+      alert_msg.alertDebug.alertText2 = f'v={v_ego * 3.6:.1f}km/h t_la={action_t:.2f}s age={age * 1000:.0f}ms'
     pm.send('alertDebug', alert_msg)
 
+    # lateralPlan 계산
     lat_msg = messaging.new_message('lateralManeuverPlan')
     lat_msg.valid = actions is not None and lat_active
     if lat_msg.valid:
       lat_msg.lateralManeuverPlan.desiredCurvature = float(kappa)
     pm.send('lateralManeuverPlan', lat_msg)
 
-    # On timeout: still publish long with aTarget=0 (plannerd is off) — coast / hold
+    # longitudinalPlan 계산
     long_msg = messaging.new_message('longitudinalPlan')
     long_msg.valid = True
     long_plan = long_msg.longitudinalPlan
