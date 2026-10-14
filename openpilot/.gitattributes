@@ -1,0 +1,4 @@
+selfdrive/modeld/models/*.onnx filter=lfs diff=lfs merge=lfs -text
+selfdrive/modeld/models/*.pkl filter=lfs diff=lfs merge=lfs -text
+selfdrive/modeld/models/*.dlc filter=lfs diff=lfs merge=lfs -text
+selfdrive/modeld/models/*.bin filter=lfs diff=lfs merge=lfs -text
