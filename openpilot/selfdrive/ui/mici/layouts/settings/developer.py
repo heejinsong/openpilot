@@ -161,7 +161,9 @@ class DeveloperLayoutMici(NavScroller):
       long_man_enabled = ui_state.has_longitudinal_control and ui_state.is_offroad()
       self._long_maneuver_toggle.set_enabled(long_man_enabled)
       self._lat_maneuver_toggle.set_enabled(ui_state.is_offroad())
-      self._waypoint_toggle.set_enabled(ui_state.is_offroad())
+      # Waypoint can be armed while ignition is on, as long as openpilot is not engaged.
+      # An onroad cycle would clear WaypointMode (CLEAR_ON_OFFROAD_TRANSITION).
+      self._waypoint_toggle.set_enabled(lambda: not ui_state.engaged)
     else:
       self._long_maneuver_toggle.set_enabled(False)
       self._lat_maneuver_toggle.set_enabled(False)
@@ -210,7 +212,6 @@ class DeveloperLayoutMici(NavScroller):
     self._long_maneuver_toggle.set_checked(False)
     ui_state.params.put_bool("LateralManeuverMode", False, block=True)
     self._lat_maneuver_toggle.set_checked(False)
-    restart_needed_callback()
 
   def _on_alpha_long_enabled(self, state: bool):
     def do_toggle(_state: bool):
