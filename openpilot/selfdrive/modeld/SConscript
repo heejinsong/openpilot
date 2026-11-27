@@ -38,7 +38,16 @@ compiler = Dir('#tinygrad_repo/examples/openpilot').abspath
 # build on all cores
 taskset = 'taskset -c 0-7 ' if arch == 'comma_arm64' else ''
 
+# Release branches ship the models already compiled for the device (QCOM) and strip the
+# ONNX sources. Without the `prebuilt` marker the device runs a full scons build, which
+# would otherwise try to recompile every model from ONNX on the device. Keep the shipped pkls.
+release = not os.path.exists(Dir('#').File('.gitmodules').abspath)
+def shipped(pkl_path):
+  return release and os.path.isfile(File(pkl_path).abspath)
+
 def compile_model(onnx_path, pkl_path):
+  if shipped(pkl_path) and not os.path.isfile(File(onnx_path).abspath):
+    return
   onnx_path, target_pkl_path = File(onnx_path).abspath, File(pkl_path).abspath
   cmd = (f'{tg_flags} {mac_brew_string} {taskset}python3 "{compiler}/compile_onnx.py" '
          f'"{onnx_path}" "{target_pkl_path}" --out-of-band --benchmark-runs 1')
@@ -54,6 +63,8 @@ compile_model('models/driving_supercombo.onnx', 'models/driving_tinygrad.pkl')
 model_w, model_h = MEDMODEL_INPUT_SIZE
 for cam_w, cam_h in camera_configs:
   warp_pkl_path = File(f"models/driving_warp_{cam_w}x{cam_h}_tinygrad.pkl").abspath
+  if shipped(warp_pkl_path):
+    continue
   stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
   cmd = (f'{tg_flags} {mac_brew_string} {taskset}python3 "{compiler}/compile_warp.py" '
          f'--frame {cam_w},{cam_h},{stride},{y_height},{uv_height},{stride * (y_height + uv_height)} '
@@ -64,6 +75,8 @@ for cam_w, cam_h in camera_configs:
 dm_w, dm_h = DM_INPUT_SIZE
 for cam_w, cam_h in camera_configs:
   dm_pkl_path = File(f"models/dm_warp_{cam_w}x{cam_h}_tinygrad.pkl").abspath
+  if shipped(dm_pkl_path):
+    continue
   stride, y_height, uv_height, frame_size = get_nv12_info(cam_w, cam_h)
   cmd = (f'{tg_flags} {mac_brew_string} python3 "{compiler}/compile_warp.py" '
          f'--frame {cam_w},{cam_h},{stride},{y_height},{uv_height},{frame_size} --warp-to {dm_w}x{dm_h} '
